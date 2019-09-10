@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Wireguard VPN appliances
+
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  AMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+
+  InstanceType:
+    Type: String
+    Default: t3.nano
+    AllowedValues: [t3a.nano, t3.nano]
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+
+  InternalPeerIp:
+    Type: String
+
+  InternalServerIp:
+    Type: String
+
+  WireguardPort:
+    Type: String
+
+  ParameterStoreKMSKeyARN:
+    Type: String
+
+  VPNDomainName:
+    Type: String
+
+  VPNDomainHostedZoneId:
+    Type: String
+
+Resources:
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref VPNDomainHostedZoneId
+      Comment: !Ref AWS::StackName
+      Name: !Ref VPNDomainName
+      TTL: 300
+      Type: CNAME
+      ResourceRecords:
+        - !GetAtt LoadBalancer.DNSName
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: true
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      Type: network
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref WireguardPort
+      Protocol: UDP
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      HealthCheckPort: 22
+      HealthCheckProtocol: TCP
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Protocol: UDP
+      Port: !Ref WireguardPort
+      TargetType: instance
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 0
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Wireguard Security Group
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: -1
+          CidrIpv6: ::/0
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: !Ref WireguardPort
+          ToPort: !Ref WireguardPort
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: !Ref WireguardPort
+          ToPort: !Ref WireguardPort
+          CidrIpv6: ::/0
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: wireguard
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:ModifyInstanceAttribute
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wireguard/*
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Ref ParameterStoreKMSKeyARN
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AMIID
+        InstanceInitiatedShutdownBehavior: terminate
+        InstanceType: !Ref InstanceType
+        AssociatePublicIpAddress: true
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt SecurityGroup.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: wireguard
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #cloud-config
+              repo_update: true
+              repo_upgrade: all
+              write_files:
+                - path: /etc/cron.d/wg
+                  permissions: '0700'
+                  owner: root:root
+                  content: |
+                    */1 * * * * root /root/wg-check.sh
+                - path: /root/wg-check.sh
+                  permissions: '0700'
+                  owner: root:root
+                  content: |
+                    #!/bin/bash
+                    count=$(wg | wc -c);
+                    if [[ `echo $count` == 0 ]]; then
+                      wg-quick up wg0
+                    else
+                      wg
+                    fi;
+                - path: /etc/wireguard/wg0.conf
+                  permissions: '0600'
+                  owner: root:root
+                  content: |
+                    [Interface]
+                    Address = ${InternalServerIp}
+                    ListenPort = ${WireguardPort}
+                    PrivateKey = PRIVATEKEY
+                    SaveConfig = true
+                    PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+                    PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; ip6tables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+                    [Peer]
+                    PublicKey = PEER1PUBLIC
+                    AllowedIPs = ${InternalPeer1Ip}
+
+                - path: /root/bootstrap.sh
+                  permissions: '0700'
+                  owner: root:root
+                  content: |
+                    #!/bin/bash
+                    set -euxo pipefail;
+                    trap "/opt/aws/bin/cfn-signal --success false --region ${AWS::Region} --stack ${AWS::StackName} --resource AutoScalingGroup;" ERR;
+
+                    # General
+                    yum update -y;
+                    curl -Lo /etc/yum.repos.d/wireguard.repo https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-7/jdoss-wireguard-epel-7.repo;
+                    yum install wireguard-dkms wireguard-tools iptables-services -y;
+
+                    # Wireguard keys
+                    set +x;
+                    PRIVATE_KEY=$(aws --region ${AWS::Region} ssm get-parameter --name /wireguard/private --with-decryption --query Parameter.Value --output text);
+                    PEER_PUBLIC_KEY=$(aws --region ${AWS::Region} ssm get-parameter --name /wireguard/peerpublic --with-decryption --query Parameter.Value --output text);
+                    sed -i "s#PRIVATEKEY#$PRIVATE_KEY#" /etc/wireguard/wg0.conf;
+                    sed -i "s#PEER1PUBLIC#$PEER_PUBLIC_KEY#" /etc/wireguard/wg0.conf;
+                    set -x;
+
+                    # source/dest check
+                    INSTANCE_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id);
+                    aws ec2 --region ${AWS::Region} modify-instance-attribute --instance-id $INSTANCE_ID --no-source-dest-check;
+
+                    # iptables
+                    systemctl enable iptables;
+                    systemctl restart iptables;
+                    systemctl status iptables;
+                    iptables -F;
+                    iptables-save > /etc/sysconfig/iptables;
+                    iptables -L;
+
+                    # IP Forwarding
+                    echo "
+                    net.ipv4.conf.all.forwarding = 1
+                    net.ipv6.conf.all.forwarding = 1
+                    " > /etc/sysctl.d/wg.conf;
+                    sysctl --system;
+
+                    systemctl enable wg-quick@wg0.service;
+                    /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource AutoScalingGroup;
+                    reboot;
+
+  AutoUpdateScaleUp:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      DesiredCapacity: 2
+      MinSize: 1
+      MaxSize: 2
+      Recurrence: '0 14 * * *'
+
+  AutoUpdateScaleDown:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      DesiredCapacity: 1
+      MinSize: 1
+      MaxSize: 2
+      Recurrence: '10 14 * * *'
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds
+      DesiredCapacity: 1
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 1
+        MinSuccessfulInstancesPercent: 100
+        PauseTime: PT5M
+        SuspendProcesses:
+          - ScheduledActions
+          - AZRebalance
+          - ReplaceUnhealthy
+        WaitOnResourceSignals: true

@@ -1,0 +1,100 @@
+Parameters:
+
+  RepoOwner:
+    Type: String
+    Description: Username of the Github Repo owner
+
+  RepoName:
+    Type: String
+    Description: Name of the Github Repo
+
+  GithubCredsSecret:
+    Type: String
+    Description: Name of the AWS Secrets Manager Secret for Github creds
+
+  GithubCredsSecretParam:
+    Type: String
+    Description: Key of the Personal Access Token in the Secret
+
+Resources:
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref RepoName
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineBucket
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: source
+              Configuration:
+                Owner: !Ref RepoOwner
+                Repo: !Ref RepoName
+                Branch: master
+                OAuthToken: !Sub '{{resolve:secretsmanager:${GithubCredsSecret}:SecretString:${GithubCredsSecretParam}}}'
+              RunOrder: 1
+        - Name: Update
+          Actions:
+            - Name: Pipeline
+              RunOrder: 1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts:
+                - Name: source
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: !Ref AWS::StackName
+                RoleArn: !GetAtt CodePipelineRole.Arn
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                TemplatePath: source::pipeline.yml
+        - Name: Deploy
+          Actions:
+            - Name: Controller
+              RunOrder: 1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts:
+                - Name: source
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                StackName: wireguard
+                RoleArn: !GetAtt CodePipelineRole.Arn
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                TemplatePath: source::wireguard.yml
+                TemplateConfiguration: !Sub source::config/wireguard-${AWS::Region}.json
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
