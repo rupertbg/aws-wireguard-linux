@@ -152,11 +152,13 @@ Resources:
         ImageId: !Ref AMIID
         InstanceInitiatedShutdownBehavior: terminate
         InstanceType: !Ref InstanceType
-        AssociatePublicIpAddress: true
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            Groups:
+              - !GetAtt SecurityGroup.GroupId
+            DeviceIndex: 0
         IamInstanceProfile:
           Arn: !GetAtt InstanceProfile.Arn
-        SecurityGroupIds:
-          - !GetAtt SecurityGroup.GroupId
         TagSpecifications:
           - ResourceType: instance
             Tags:
